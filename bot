@@ -1,0 +1,378 @@
+#!/usr/bin/env python3
+"""
+bot - Unified Quantitative Trading Console
+Executable operator tool for production monitoring, signal explainability, and job control.
+"""
+import sys
+import os
+import argparse
+import time
+from datetime import datetime, date
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+# Ensure project root is in sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from database.connection import get_connection
+from config import load_config
+from execution.capital_client import CapitalBrokerClient
+from monitoring.circuit_breaker import get_circuit_breaker_status
+
+# ANSI Color Codes
+G = "\033[92m"  # Green
+R = "\033[91m"  # Red
+Y = "\033[93m"  # Yellow
+C = "\033[96m"  # Cyan
+B = "\033[1m"   # Bold
+DIM = "\033[2m" # Dim
+X = "\033[0m"   # Reset
+
+def _get_broker():
+    cfg = load_config()
+    return CapitalBrokerClient(
+        api_key=cfg.api_key,
+        identifier=cfg.identifier,
+        password=cfg.password,
+        demo=cfg.is_demo,
+    )
+
+# ============================================================================
+# 1. BOT STATUS (Live Cockpit Overview)
+# ============================================================================
+def cmd_status(args):
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    now_wat = datetime.now(ZoneInfo("Africa/Lagos"))
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+
+    print(f"\n{B}{C}=== QUANTITATIVE SYSTEM COCKPIT ==={X}")
+    print(f"{B}Clocks:{X}   WAT: {now_wat.strftime('%H:%M:%S')}  |  ET: {now_et.strftime('%H:%M:%S')}  |  UTC: {now_utc.strftime('%H:%M:%S')}")
+
+    # Broker Connectivity Check
+    t0 = time.time()
+    try:
+        broker = _get_broker()
+        remote_positions = broker.fetch_open_positions()
+        latency = int((time.time() - t0) * 1000)
+        broker_str = f"{G}ONLINE{X} ({latency}ms | Auth OK | Live Positions: {len(remote_positions)})"
+    except Exception as e:
+        broker_str = f"{R}OFFLINE ({e}){X}"
+
+    print(f"{B}Broker:{X}   Capital.com -> {broker_str}")
+
+    with get_connection() as conn:
+        # Circuit Breakers
+        cb_status = get_circuit_breaker_status(conn)
+        if cb_status.is_active:
+            cb_str = f"{R}TRIPPED ({cb_status.reason}){X}"
+        else:
+            cb_str = f"{G}ARMED & HEALTHY (0 Tripped){X}"
+        print(f"{B}Safety:{X}   Circuit Breaker -> {cb_str}")
+
+        cur = conn.cursor()
+
+        # Active Watchlist
+        cur.execute("SELECT COUNT(*), assigned_engine FROM weekly_watchlist WHERE superseded_at IS NULL GROUP BY assigned_engine")
+        wl_counts = dict(cur.fetchall())
+        mr_c = wl_counts.get("MEAN_REVERSION", 0)
+        bo_c = wl_counts.get("BREAKOUT", 0)
+        total_wl = mr_c + bo_c
+        print(f"{B}Universe:{X} Active Watchlist: {B}{total_wl}{X} Assets ({C}{mr_c} MR{X} | {Y}{bo_c} BO{X})")
+
+        # Today's Signals
+        target_date = args.date or now_et.strftime("%Y-%m-%d")
+        cur.execute("""
+            SELECT signal_status, COUNT(*) 
+            FROM daily_signals 
+            WHERE signal_date = ? 
+            GROUP BY signal_status
+        """, (target_date,))
+        sig_counts = dict(cur.fetchall())
+        pending = sig_counts.get("PENDING", 0)
+        promoted = sig_counts.get("PROMOTED", 0)
+        aborted = sig_counts.get("ABORTED", 0)
+        print(f"{B}Signals:{X}  Date ({target_date}) -> {G}{pending} Pending{X} | {C}{promoted} Promoted{X} | {R}{aborted} Aborted{X}")
+
+        # Active Positions
+        cur.execute("SELECT COUNT(*) FROM orders_and_positions WHERE order_status = 'OPEN'")
+        open_pos = cur.fetchone()[0]
+        print(f"{B}Trades:{X}   Local DB Open Positions -> {B}{open_pos}{X}")
+
+    print(f"{C}{'=' * 55}{X}\n")
+
+# ============================================================================
+# 2. BOT WATCHLIST (Formatted Top 15 View)
+# ============================================================================
+def cmd_watchlist(args):
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT sunday_composite_rank, epic, sector, region, assigned_engine, 
+                   permitted_direction, ROUND(sunday_composite_score, 2), ROUND(atr_pct_60d, 2)
+            FROM weekly_watchlist
+            WHERE superseded_at IS NULL
+            ORDER BY sunday_composite_rank ASC
+        """)
+        rows = cur.fetchall()
+
+    print(f"\n{B}ACTIVE TOP 15 WATCHLIST{X}")
+    print("=" * 105)
+    print(f"{'Rank':<6}{'Epic':<10}{'Sector':<24}{'Region':<8}{'Engine':<18}{'Direction':<14}{'Score':<8}{'ATR%':<6}")
+    print("-" * 105)
+    for r in rows:
+        eng_color = C if r[4] == "MEAN_REVERSION" else Y
+        dir_color = G if "LONG" in r[5] or r[5] == "BOTH" else R
+        sector_str = str(r[2]) if r[2] else "N/A"
+        print(f"{r[0]:<6}{B}{r[1]:<10}{X}{sector_str:<24}{r[3]:<8}{eng_color}{r[4]:<18}{X}{dir_color}{r[5]:<14}{X}{r[6]:<8}{r[7]:<6}")
+    print("=" * 105 + "\n")
+
+# ============================================================================
+# 3. BOT SIGNALS (Today's Action Tickets)
+# ============================================================================
+def cmd_signals(args):
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    target_date = args.date or now_et.strftime("%Y-%m-%d")
+    with get_connection() as conn:
+        cur = conn.cursor()
+        query = """
+            SELECT epic, engine, direction, signal_status, 
+                   ROUND(signal_close_price, 2), ROUND(structural_stop_price, 2), 
+                   ROUND(target_price, 2), ROUND(initial_rr_ratio, 2), abort_reason
+            FROM daily_signals
+        """
+        params = []
+        if not args.all:
+            query += " WHERE signal_date = ?"
+            params.append(target_date)
+        query += " ORDER BY created_at DESC"
+        cur.execute(query, params)
+        rows = cur.fetchall()
+
+    print(f"\n{B}DAILY SIGNALS {'(All Dates)' if args.all else f'({target_date})'}{X}")
+    print("=" * 115)
+    print(f"{'Epic':<8}{'Engine':<16}{'Dir':<12}{'Status':<12}{'Close':<10}{'Stop':<10}{'Target':<10}{'R:R':<8}{'Details':<20}")
+    print("-" * 115)
+    if not rows:
+        print(f"{DIM}No signals logged for {target_date}. Run: bot run phase1 --date {target_date}{X}")
+    for r in rows:
+        st = r[3]
+        st_color = G if st == "PENDING" else (C if st == "PROMOTED" else R)
+        tgt = str(r[6]) if r[6] is not None else "-"
+        rr = str(r[7]) if r[7] is not None else "-"
+        reason = r[8] if r[8] is not None else "Active Trigger"
+        print(f"{B}{r[0]:<8}{X}{r[1]:<16}{r[2]:<12}{st_color}{st:<12}{X}{r[4]:<10.2f}{r[5]:<10.2f}{tgt:<10}{rr:<8}{DIM}{reason:<20}{X}")
+    print("=" * 115 + "\n")
+
+# ============================================================================
+# 4. BOT WHY (Forensic Explainability for an Epic)
+# ============================================================================
+def cmd_why(args):
+    epic = args.epic.upper()
+    print(f"\n{B}{C}=== FORENSIC EXPLAINABILITY INSPECTOR: {epic} ==={X}")
+
+    with get_connection() as conn:
+        cur = conn.cursor()
+
+        # 1. Watchlist Membership Check
+        cur.execute("""
+            SELECT sunday_composite_rank, sector, region, assigned_engine, permitted_direction, sunday_composite_score
+            FROM weekly_watchlist
+            WHERE epic = ? AND superseded_at IS NULL
+        """, (epic,))
+        wl = cur.fetchone()
+
+        if not wl:
+            print(f"{R}[!] Asset '{epic}' is NOT on the active weekly watchlist.{X}")
+            print(f"    Possible reasons: Low ADV (<$5M), High Gaps (>2), Poor 200 SMA fit (R²<0.70), or Sector Capped.")
+            print("=" * 65 + "\n")
+            return
+
+        sector_str = wl[1] or "General"
+        print(f"{B}Watchlist Rank:{X} #{wl[0]} | {B}Engine:{X} {wl[3]} | {B}Sector:{X} {sector_str} ({wl[2]}) | {B}Direction:{X} {wl[4]}")
+        print(f"{B}Funnel Score:{X}   {wl[5]}")
+
+        # 2. Latest Signal Audit
+        cur.execute("""
+            SELECT signal_date, signal_status, direction, signal_close_price, 
+                   structural_stop_price, target_price, initial_rr_ratio, abort_reason, created_at
+            FROM daily_signals
+            WHERE epic = ?
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (epic,))
+        sig = cur.fetchone()
+
+        print("-" * 65)
+        if not sig:
+            print(f"{Y}[*] No daily signals recorded yet for {epic}. Run Phase 1 post-close.{X}")
+        else:
+            s_date, status, direction, close_p, stop_p, target_p, rr, abort_rsn, created = sig
+            st_color = G if status in ("PENDING", "PROMOTED") else R
+            print(f"{B}Latest Signal:{X}  {s_date} -> Status: {st_color}{B}{status}{X}")
+            print(f"{B}Trigger Setup:{X}  Direction: {direction} | Close: ${close_p:.2f}")
+            print(f"{B}Stop Level:{X}     ${stop_p:.2f} (Risk = ${abs(close_p - stop_p):.2f})")
+            if target_p:
+                print(f"{B}Target (20 SMA):{X}${target_p:.2f} (Reward = ${abs(target_p - close_p):.2f})")
+                print(f"{B}Reward/Risk:{X}    {B}{rr:.2f}{X} (Engine A Floor: >= 1.20)")
+
+            if status == "ABORTED":
+                print(f"\n{R}{B}[VETO RATIONALE]:{X} {abort_rsn}")
+                if abort_rsn == "RR_BELOW_FLOOR":
+                    print(f"  -> Mathematical R:R ({rr:.2f}) was below required threshold (1.20).")
+                    print(f"  -> Capital preservation rule prevented entry.")
+            elif status == "PENDING":
+                print(f"\n{G}{B}[ACTIONABLE]:{X} Setup qualified and queued for morning Phase 2/3.")
+
+    print("=" * 65 + "\n")
+
+# ============================================================================
+# 5. BOT POSITIONS (Executed Orders & Live Positions)
+# ============================================================================
+def cmd_positions(args):
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT client_order_id, epic, sub_account, direction, order_status,
+                   ROUND(actual_fill_price, 2), ROUND(allocated_units, 2),
+                   ROUND(current_stop_price, 2), ROUND(target_price, 2)
+            FROM orders_and_positions
+            ORDER BY created_at DESC
+            LIMIT ?
+        """, (args.limit,))
+        rows = cur.fetchall()
+
+    print(f"\n{B}EXECUTED ORDERS & OPEN POSITIONS{X}")
+    print("=" * 115)
+    print(f"{'Order ID':<26}{'Epic':<8}{'Account':<12}{'Dir':<10}{'Status':<10}{'Fill':<10}{'Units':<8}{'Stop':<10}{'Target':<10}")
+    print("-" * 115)
+    if not rows:
+        print(f"{DIM}No executed orders logged in database.{X}")
+    for r in rows:
+        fill = str(r[5]) if r[5] is not None else "-"
+        units = str(r[6]) if r[6] is not None else "-"
+        stop = str(r[7]) if r[7] is not None else "-"
+        tgt = str(r[8]) if r[8] is not None else "-"
+        print(f"{r[0]:<26}{B}{r[1]:<8}{X}{r[2]:<12}{r[3]:<10}{r[4]:<10}{fill:<10}{units:<8}{stop:<10}{tgt:<10}")
+    print("=" * 115 + "\n")
+
+# ============================================================================
+# 6. BOT DOCTOR (System Pre-Flight Health Check)
+# ============================================================================
+def cmd_doctor(args):
+    print(f"\n{B}SYSTEM DOCTOR: DIAGNOSTIC AUDIT{X}")
+    print("=" * 60)
+
+    # 1. Database Integrity
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("PRAGMA integrity_check;")
+            res = cur.fetchone()[0]
+            status = f"{G}[PASS]{X} ({res})" if res == "ok" else f"{R}[FAIL]{X} ({res})"
+            print(f"1. SQLite Database:      {status}")
+    except Exception as e:
+        print(f"1. SQLite Database:      {R}[FAIL]{X} ({e})")
+
+    # 2. Schema Verification
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM weekly_watchlist WHERE superseded_at IS NULL")
+            wl_c = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM daily_signals")
+            sig_c = cur.fetchone()[0]
+            print(f"2. Database Records:     {G}[PASS]{X} ({wl_c} Watchlist, {sig_c} Signals)")
+    except Exception as e:
+        print(f"2. Database Records:     {R}[FAIL]{X} ({e})")
+
+    # 3. Capital.com API Handshake
+    t0 = time.time()
+    try:
+        broker = _get_broker()
+        open_pos = broker.fetch_open_positions()
+        lat = int((time.time() - t0) * 1000)
+        print(f"3. Capital.com Broker:   {G}[PASS]{X} (Latency: {lat}ms | Auth OK)")
+    except Exception as e:
+        print(f"3. Capital.com Broker:   {R}[FAIL]{X} ({e})")
+
+    # 4. Market Hours Verification
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    is_weekend = now_et.weekday() >= 5
+    mkt_status = f"{Y}WEEKEND (Markets Closed){X}" if is_weekend else f"{G}WEEKDAY SESSION{X}"
+    print(f"4. Market Status:        {mkt_status} (ET: {now_et.strftime('%A %H:%M')})")
+    print("=" * 60 + "\n")
+
+# ============================================================================
+# 7. BOT RUN (Job Execution Shortcuts)
+# ============================================================================
+def cmd_run(args):
+    import subprocess
+    phase = args.phase.lower()
+    date_arg = ["--date", args.date] if args.date else []
+
+    if phase in ("screen", "screening"):
+        cmd = ["python3", "scripts/run_screening.py", "--adhoc"]
+    elif phase in ("phase1", "close"):
+        cmd = ["python3", "scripts/run_daily_daemon.py", "--phase-1"] + date_arg
+    elif phase in ("phase2", "premarket"):
+        cmd = ["python3", "scripts/run_daily_daemon.py", "--phase-2"] + date_arg
+    elif phase in ("phase3", "open"):
+        cmd = ["python3", "scripts/run_daily_daemon.py", "--phase-3"] + date_arg
+    elif phase == "boot":
+        cmd = ["python3", "scripts/run_daily_daemon.py", "--boot"]
+    else:
+        print(f"{R}Unknown phase '{phase}'. Choose from: screen, phase1 (close), phase2 (premarket), phase3 (open), boot{X}")
+        return
+
+    print(f"{B}Executing: {' '.join(cmd)}{X}\n")
+    subprocess.run(cmd)
+
+# ============================================================================
+# CLI ARGUMENT PARSER
+# ============================================================================
+def main():
+    parser = argparse.ArgumentParser(prog="bot", description="Master Quantitative Operator Console")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # status
+    p_stat = subparsers.add_parser("status", help="Cockpit summary (broker, clocks, signals, breakers)")
+    p_stat.add_argument("--date", type=str, default=None, help="Target date YYYY-MM-DD")
+    p_stat.set_defaults(func=cmd_status)
+
+    # watchlist / list
+    p_wl = subparsers.add_parser("watchlist", aliases=["wl", "list"], help="View active weekly watchlist")
+    p_wl.set_defaults(func=cmd_watchlist)
+
+    # signals
+    p_sig = subparsers.add_parser("signals", aliases=["sig"], help="View today's generated action tickets")
+    p_sig.add_argument("--date", type=str, default=None, help="Trading date (YYYY-MM-DD)")
+    p_sig.add_argument("--all", action="store_true", help="View all historical signals")
+    p_sig.set_defaults(func=cmd_signals)
+
+    # why
+    p_why = subparsers.add_parser("why", help="Explainability inspector for a specific asset (e.g. bot why TSLA)")
+    p_why.add_argument("epic", type=str, help="Ticker symbol (e.g. TSLA, ASML, GOOGL)")
+    p_why.set_defaults(func=cmd_why)
+
+    # positions / orders
+    p_pos = subparsers.add_parser("positions", aliases=["pos", "orders"], help="View executed orders and open positions")
+    p_pos.add_argument("--limit", type=int, default=25, help="Maximum records to display")
+    p_pos.set_defaults(func=cmd_positions)
+
+    # doctor
+    p_doc = subparsers.add_parser("doctor", aliases=["doc"], help="Run pre-flight health & latency audit")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    # run
+    p_run = subparsers.add_parser("run", help="Trigger pipeline job (screen, close, premarket, open)")
+    p_run.add_argument("phase", type=str, help="screen | phase1 (close) | phase2 (premarket) | phase3 (open) | boot")
+    p_run.add_argument("--date", type=str, default=None, help="Date YYYY-MM-DD")
+    p_run.set_defaults(func=cmd_run)
+
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    main()
